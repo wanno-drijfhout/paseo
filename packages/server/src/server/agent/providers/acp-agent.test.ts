@@ -109,6 +109,171 @@ interface ACPSessionInternals {
   acpMcpServers(): unknown[];
 }
 
+interface ACPCancellationInternals {
+  sessionId: string | null;
+  connection: Pick<ClientSideConnection, "prompt" | "cancel" | "signal">;
+}
+
+describe("ACP foreground cancellation settlement", () => {
+  test("interrupt waits for the canceled prompt before a replacement can start", async () => {
+    const session = createSessionWithConfig({ provider: "mistral-vibe" });
+    let finishPrompt!: (response: PromptResponse) => void;
+    const pendingPrompt = new Promise<PromptResponse>((resolve) => {
+      finishPrompt = resolve;
+    });
+    let requests = 0;
+    let cancels = 0;
+    const internals = asInternals<ACPCancellationInternals>(session);
+    internals.sessionId = "cancel-session";
+    internals.connection = {
+      signal: new AbortController().signal,
+      prompt: async () => {
+        requests++;
+        if (requests === 1) return pendingPrompt;
+        return { stopReason: "end_turn" };
+      },
+      cancel: async () => {
+        cancels++;
+      },
+    };
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    const first = await session.startTurn("first prompt");
+    let interrupted = false;
+    const interruption = session.interrupt().then(() => {
+      interrupted = true;
+      return;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(cancels).toBe(1);
+    expect(interrupted).toBe(false);
+    expect(terminalEvents(events)).toEqual([]);
+
+    finishPrompt({ stopReason: "cancelled" });
+    await interruption;
+    const second = await session.startTurn("replacement prompt");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(terminalEvents(events)).toEqual([
+      {
+        type: "turn_canceled",
+        provider: "mistral-vibe",
+        reason: "Interrupted",
+        turnId: first.turnId,
+      },
+      { type: "turn_completed", provider: "mistral-vibe", usage: undefined, turnId: second.turnId },
+    ]);
+    expect(requests).toBe(2);
+    await session.close();
+  });
+
+  test("a failed prompt also releases a pending interruption", async () => {
+    const session = createSession();
+    let failPrompt!: (error: Error) => void;
+    const pendingPrompt = new Promise<PromptResponse>((_resolve, reject) => {
+      failPrompt = reject;
+    });
+    let requests = 0;
+    const internals = asInternals<ACPCancellationInternals>(session);
+    internals.sessionId = "cancel-session";
+    internals.connection = {
+      signal: new AbortController().signal,
+      prompt: async () => {
+        requests++;
+        if (requests === 1) return pendingPrompt;
+        return { stopReason: "end_turn" };
+      },
+      cancel: async () => {},
+    };
+    const events: AgentStreamEvent[] = [];
+    session.subscribe((event) => events.push(event));
+    await session.startTurn("first prompt");
+    const interruption = session.interrupt();
+    failPrompt(new Error("upstream request failed during cancellation"));
+    await interruption;
+    await session.startTurn("next prompt");
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(terminalEvents(events).map((event) => event.type)).toEqual([
+      "turn_failed",
+      "turn_completed",
+    ]);
+    expect(requests).toBe(2);
+    await session.close();
+  });
+
+  test("a rejected cancel preserves ownership until the original prompt settles", async () => {
+    const session = createSession();
+    let finishPrompt!: (response: PromptResponse) => void;
+    const pendingPrompt = new Promise<PromptResponse>((resolve) => {
+      finishPrompt = resolve;
+    });
+    const internals = asInternals<ACPCancellationInternals>(session);
+    internals.sessionId = "cancel-session";
+    internals.connection = {
+      signal: new AbortController().signal,
+      prompt: async () => pendingPrompt,
+      cancel: async () => {
+        throw new Error("cancel transport unavailable");
+      },
+    };
+    await session.startTurn("first prompt");
+    await expect(session.interrupt()).rejects.toThrow("cancel transport unavailable");
+    await expect(session.startTurn("replacement prompt")).rejects.toThrow(
+      "A foreground turn is already active",
+    );
+    finishPrompt({ stopReason: "end_turn" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await session.interrupt();
+    await session.close();
+  });
+
+  test("close releases interruption waiters only after the runtime has been released", async () => {
+    const terminator = new FakeTerminator("deferred");
+    const session = createSession({ terminateProcess: terminator.terminate });
+    const child = createTerminalChildStub();
+    const internals = asInternals<ACPCancellationInternals>(session);
+    asInternals<ACPCloseInternals>(session).child = child;
+    internals.sessionId = "cancel-session";
+    internals.connection = {
+      signal: new AbortController().signal,
+      prompt: async () => new Promise<PromptResponse>(() => {}),
+      cancel: async () => {},
+    };
+    await session.startTurn("first prompt");
+    let interrupted = false;
+    const interruption = session.interrupt().then(() => {
+      interrupted = true;
+      return;
+    });
+    const closing = session.close();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(terminator.terminated).toEqual([child]);
+    expect(interrupted).toBe(false);
+    terminator.releaseAll();
+    await closing;
+    await interruption;
+    expect(interrupted).toBe(true);
+    await expect(session.startTurn("after close")).rejects.toThrow("session is closed");
+  });
+
+  test("an idle interruption sends no cancel notification", async () => {
+    const session = createSession();
+    let cancels = 0;
+    const internals = asInternals<ACPCancellationInternals>(session);
+    internals.sessionId = "cancel-session";
+    internals.connection = {
+      signal: new AbortController().signal,
+      prompt: async () => ({ stopReason: "end_turn" }),
+      cancel: async () => {
+        cancels++;
+      },
+    };
+    await session.interrupt();
+    expect(cancels).toBe(0);
+    await session.close();
+  });
+});
+
 function openPromptConnection(
   prompt: (...args: unknown[]) => Promise<unknown>,
 ): ACPSessionInternals["connection"] {

@@ -1714,6 +1714,11 @@ export class ACPAgentClient implements AgentClient {
   }
 }
 
+interface ForegroundTurnSettlement {
+  promise: Promise<void>;
+  resolve: () => void;
+}
+
 export class ACPAgentSession implements AgentSession, ACPClient {
   readonly provider: string;
   readonly capabilities: AgentCapabilityFlags;
@@ -1785,6 +1790,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private readonly extensionCommandsParser?: ACPExtensionCommandsParser;
   private currentTurnUsage: AgentUsage | undefined;
   private activeForegroundTurnId: string | null = null;
+  private foregroundTurnSettlement: ForegroundTurnSettlement | null = null;
   private fallbackAssistantMessageId: string | null = null;
   private closed = false;
   private historyPending = false;
@@ -2003,6 +2009,11 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     const turnId = randomUUID();
     const messageId = options?.clientMessageId ?? randomUUID();
     this.activeForegroundTurnId = turnId;
+    let resolve!: () => void;
+    const promise = new Promise<void>((settle) => {
+      resolve = settle;
+    });
+    this.foregroundTurnSettlement = { promise, resolve };
     this.fallbackAssistantMessageId = null;
     this.submittedUserMessageTurnId = null;
     this.emitBootstrapThreadEvent();
@@ -2585,7 +2596,12 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.cancelPendingPermissions();
 
     if (this.activeForegroundTurnId) {
+      const settlement = this.foregroundTurnSettlement;
+      // session/cancel is a notification, not an acknowledgment that the turn
+      // stopped. Keep the manager's cancellation pending until session/prompt
+      // settles so its timeout cannot admit another prompt into a busy session.
       await this.connection.cancel({ sessionId: this.sessionId });
+      await settlement?.promise;
     }
   }
 
@@ -2652,6 +2668,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
     this.connection = null;
     this.child = null;
     this.activeForegroundTurnId = null;
+    this.foregroundTurnSettlement?.resolve();
+    this.foregroundTurnSettlement = null;
   }
 
   async requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
@@ -3485,6 +3503,8 @@ export class ACPAgentSession implements AgentSession, ACPClient {
   private finishTurn(
     event: Extract<AgentStreamEvent, { type: "turn_completed" | "turn_failed" | "turn_canceled" }>,
   ): void {
+    const settlement = this.foregroundTurnSettlement;
+    this.foregroundTurnSettlement = null;
     this.deliverTranslatedEvents(this.flushPendingUserMessage());
     // Failed and canceled turns clear every request in the manager. Answer the
     // same set here so an outside-turn request cannot keep the provider blocked.
@@ -3497,6 +3517,7 @@ export class ACPAgentSession implements AgentSession, ACPClient {
       this.submittedUserMessageTurnId = null;
     }
     this.pushEvent(event);
+    settlement?.resolve();
   }
 
   private cancelPendingPermissions(
